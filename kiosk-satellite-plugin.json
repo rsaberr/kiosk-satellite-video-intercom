@@ -1,0 +1,262 @@
+{
+  "schemaVersion": 1,
+  "id": "video-intercom",
+  "name": "Video Intercom",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minAndroidSdk": 26,
+  "minAppVersion": "2026.10.42",
+  "entryClass": "videointercom.VideoIntercomPlugin",
+  "description": "Video calls between kiosks, with a preview of your own camera before you pick who to call. Each kiosk shows the other kiosk's live camera with two-way hands-free voice. The person being called sees the caller while it rings. Kiosks talk directly on your local network: no server, cloud or Home Assistant in between. Kiosks with the same key find each other on the network. Needs RTSP streaming on in Camera settings on every kiosk.",
+  "author": "ersaber",
+  "license": "Apache-2.0",
+  "capabilities": [
+    "overlay",
+    "entities",
+    "host.read",
+    "host.control"
+  ],
+  "groups": [
+    {
+      "title": "Kiosks"
+    },
+    {
+      "title": "Answering"
+    },
+    {
+      "title": "Audio"
+    },
+    {
+      "title": "Camera stream"
+    },
+    {
+      "title": "Network",
+      "readingsTitle": "Call",
+      "readings": [
+        "text_sensor.call_state"
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "key": "key",
+      "type": "secret",
+      "title": "Intercom key",
+      "default": "",
+      "group": "Kiosks",
+      "description": "Any passphrase, the same on every kiosk. Kiosks with the same key find each other; others cannot call this one."
+    },
+    {
+      "key": "name",
+      "type": "string",
+      "title": "This kiosk's name",
+      "default": "",
+      "group": "Kiosks",
+      "description": "Shown on the other kiosk when this one calls. Empty uses the device name."
+    },
+    {
+      "key": "peers",
+      "type": "list",
+      "title": "Extra kiosks",
+      "group": "Kiosks",
+      "addTitle": "Add kiosk",
+      "maxItems": 8,
+      "description": "Optional. Kiosks with this plugin and the same key are found on the network by themselves. Add one here only if it is not found, such as on another subnet.",
+      "row": {
+        "title": "name"
+      },
+      "default": [],
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "title": "Name",
+          "required": true
+        },
+        {
+          "key": "address",
+          "type": "string",
+          "title": "IP address",
+          "required": true,
+          "description": "Its IP address, such as 192.168.1.69. Add :port if it listens on another port."
+        }
+      ]
+    },
+    {
+      "key": "answerMode",
+      "type": "select",
+      "title": "Answer mode",
+      "default": "Ring",
+      "options": [
+        "Ring",
+        "Answer automatically",
+        "Do not disturb"
+      ],
+      "group": "Answering",
+      "description": "Ring shows the caller's picture with Answer and Decline. Answer automatically opens the call after 3 seconds."
+    },
+    {
+      "key": "ringSeconds",
+      "type": "number",
+      "title": "Ring for",
+      "default": 30,
+      "min": 10,
+      "max": 120,
+      "step": 5,
+      "unit": "s",
+      "group": "Answering"
+    },
+    {
+      "key": "ringVolume",
+      "type": "number",
+      "title": "Ring volume",
+      "default": 70,
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "%",
+      "group": "Answering"
+    },
+    {
+      "key": "selfView",
+      "type": "boolean",
+      "title": "Show my camera during calls",
+      "default": true,
+      "group": "Answering",
+      "description": "A small picture of this kiosk's own camera in the corner of the call."
+    },
+    {
+      "key": "endGesture",
+      "type": "select",
+      "title": "End call with",
+      "default": "Double-tap the video",
+      "options": [
+        "Buttons only",
+        "Double-tap the video",
+        "Long-press the video"
+      ],
+      "group": "Answering",
+      "description": "Kiosk Satellite's own gestures do not work over the call screen, so it has its own: a double tap or a long press anywhere on the picture ends the call."
+    },
+    {
+      "key": "hangupKey",
+      "type": "select",
+      "title": "Hang up with button",
+      "default": "Off",
+      "options": [
+        "Off",
+        "Volume up",
+        "Volume down"
+      ],
+      "group": "Answering",
+      "description": "A hardware button that ends a call. It still changes the volume unless Disable volume buttons is on in Kiosk Mode."
+    },
+    {
+      "key": "callVolume",
+      "type": "number",
+      "title": "Call volume",
+      "default": 80,
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "%",
+      "group": "Audio",
+      "description": "How loud the other kiosk's voice plays here."
+    },
+    {
+      "key": "microphone",
+      "type": "select",
+      "title": "Microphone",
+      "default": "Automatic",
+      "options": [
+        "Automatic",
+        "Voice communication",
+        "Microphone",
+        "Camcorder",
+        "Voice recognition",
+        "Unprocessed"
+      ],
+      "group": "Audio",
+      "description": "Automatic uses Voice communication first, where echo cancelling works best. If the other side hears nothing, try another."
+    },
+    {
+      "key": "micRate",
+      "type": "select",
+      "title": "Microphone sample rate",
+      "default": "Automatic",
+      "options": [
+        "Automatic",
+        "16000 Hz",
+        "48000 Hz",
+        "8000 Hz"
+      ],
+      "group": "Audio"
+    },
+    {
+      "key": "muteWakeWord",
+      "type": "boolean",
+      "title": "Pause the wake word during calls",
+      "default": true,
+      "group": "Audio"
+    },
+    {
+      "key": "rtspPort",
+      "type": "number",
+      "input": "field",
+      "title": "RTSP port",
+      "default": 8080,
+      "min": 1,
+      "max": 65535,
+      "step": 1,
+      "group": "Camera stream",
+      "description": "The other kiosks' camera stream port: 8080 when Camera streaming uses ONVIF, 8554 for RTSP. If this one is refused, the plugin tries the other."
+    },
+    {
+      "key": "rtspPath",
+      "type": "string",
+      "title": "RTSP path",
+      "default": "/camera",
+      "group": "Camera stream"
+    },
+    {
+      "key": "rtspUser",
+      "type": "string",
+      "title": "RTSP username",
+      "default": "",
+      "group": "Camera stream",
+      "description": "Only if the other kiosks' streams need a login. Use the same login on every kiosk."
+    },
+    {
+      "key": "rtspPassword",
+      "type": "secret",
+      "title": "RTSP password",
+      "default": "",
+      "group": "Camera stream"
+    },
+    {
+      "key": "port",
+      "type": "number",
+      "input": "field",
+      "title": "Call port",
+      "default": 2391,
+      "min": 1024,
+      "max": 65535,
+      "step": 1,
+      "group": "Network",
+      "description": "This kiosk listens for calls here. Keep it the same on every kiosk."
+    }
+  ],
+  "commands": [
+    {
+      "id": "openMenu",
+      "title": "Open video call"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "incomingCall",
+      "title": "Incoming video call"
+    }
+  ],
+  "icon": "icon.png"
+}

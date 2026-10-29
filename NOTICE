@@ -1,0 +1,11 @@
+Video Intercom for Kiosk Satellite
+Licensed under the Apache License, Version 2.0.
+
+This plugin includes code adapted from Reolink Doorbell Intercom
+(https://github.com/patrick11994/ks-reolink-doorbell-intercom), Copyright 2026 patrick11994,
+licensed under the Apache License, Version 2.0: the RTSP client and H.264/AAC depacketizers
+(src/videointercom/media), VideoRenderer, MicCapture, CallMode, WakeWordGuard, Downsampler and TalkChannel.
+
+The plugin SDK interfaces under sdk/ are from Kiosk Satellite Plugins
+(https://github.com/jxlarrea/kiosk-satellite-plugins), licensed under the Apache License, Version 2.0.
+They are used at compile time only and are not part of the package.
