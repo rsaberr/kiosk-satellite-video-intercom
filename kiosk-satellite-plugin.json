@@ -44,7 +44,7 @@
       "title": "Intercom key",
       "default": "",
       "group": "Kiosks",
-      "description": "Any passphrase, the same on every kiosk. Kiosks with the same key find each other; others cannot call this one."
+      "description": "A long random key of at least 16 characters, the same on every kiosk; a password manager can make one. A shorter key turns calls off. Kiosks with the same key find each other; others cannot call this one."
     },
     {
       "key": "name",
@@ -93,7 +93,7 @@
         "Do not disturb"
       ],
       "group": "Answering",
-      "description": "Ring shows the caller's picture with Answer and Decline. Answer automatically opens the call after 3 seconds."
+      "description": "Ring shows the caller's picture with Answer and Decline. Answer automatically opens the call after 3 seconds, which gives anyone with the key this kiosk's audio and video without anyone touching the screen."
     },
     {
       "key": "ringSeconds",
@@ -200,6 +200,18 @@
       "group": "Audio"
     },
     {
+      "key": "wakeWordRestore",
+      "type": "boolean",
+      "title": "Wake word paused by a call",
+      "default": false,
+      "group": "Audio",
+      "description": "Managed by the plugin: set while a call has the wake word muted, so the next start unmutes it if the call was cut off.",
+      "visibleWhen": {
+        "key": "name",
+        "equals": "__internal__"
+      }
+    },
+    {
       "key": "rtspPort",
       "type": "number",
       "input": "field",
@@ -224,7 +236,7 @@
       "title": "RTSP username",
       "default": "",
       "group": "Camera stream",
-      "description": "Only if the other kiosks' streams need a login. Use the same login on every kiosk."
+      "description": "The camera streaming login, if one is set in Kiosk Satellite's camera streaming settings. Setting one is recommended, since without it anyone on the network can watch the camera. Use the same login on every kiosk."
     },
     {
       "key": "rtspPassword",

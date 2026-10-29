@@ -5,10 +5,11 @@ import java.util.Collections;
 import java.util.Map;
 
 /**
- * Mutes Kiosk Satellite's wake word during a call, so the other kiosk's voice cannot
- * set it off and the two microphone captures do not compete. It only unmutes what it muted itself: a wake word the
- * user had muted stays muted. Whether it muted is remembered across sessions (a call cut off by a crash or an update
- * would otherwise leave the wake word muted for good), and restore() puts it back at the next start.
+ * Mutes Kiosk Satellite's wake word during a call, so the other kiosk's voice cannot set it off and the two microphone
+ * captures do not compete. It only unmutes what it muted itself: a wake word the user had muted stays muted. Whether
+ * it muted is remembered across sessions through the host (the plugin keeps it in a hidden setting), because Kiosk
+ * Satellite revokes the host before it stops a plugin: a call cut off by a stop, a crash or an update would otherwise
+ * leave the wake word muted for good. restore() puts it back at the next start.
  */
 final class WakeWordGuard {
     /** The host commands this needs, as a seam for tests. */
@@ -26,6 +27,7 @@ final class WakeWordGuard {
     private boolean wanted;  // the call wants the wake word quiet
     private boolean mutedByUs;
     private boolean busy;  // a read or a mute command is on its way
+    private boolean remembered;  // what the host last kept for the next session
 
     WakeWordGuard(Host host) {
         this.host = host;
@@ -34,11 +36,20 @@ final class WakeWordGuard {
     /** The session started: if a previous one muted the wake word and never got to unmute it, unmute it now. */
     synchronized void restore(boolean rememberedMutedByUs) {
         if (!rememberedMutedByUs) return;
+        remembered = true;
         mutedByUs = true;
         settle();
     }
 
-    /** Door audio or the microphone went on (true) or both are off again (false). */
+    /**
+     * The saved settings changed. A settings form saved during a call can carry an older value than the one remembered
+     * since, so the current one is written again when they differ.
+     */
+    synchronized void saved(boolean rememberedMutedByUs) {
+        if (rememberedMutedByUs != remembered) host.remember(remembered);
+    }
+
+    /** A call's voice went on (true) or the call ended (false). */
     synchronized void setActive(boolean active) {
         wanted = active;
         settle();
@@ -56,8 +67,10 @@ final class WakeWordGuard {
                     finish(false);  // no wake word, or the user muted it: leave it alone
                     return;
                 }
+                // Remembered before the mute is sent, so a stop or a crash right after it still leaves a way back.
+                remember(true);
                 host.command("setWakeWordMuted", Collections.<String, Object>singletonMap("muted", Boolean.TRUE), (muted, ignored) -> {
-                    if (muted) host.remember(true);
+                    if (!muted) remember(false);
                     finish(muted);
                 });
             });
@@ -67,12 +80,17 @@ final class WakeWordGuard {
                 synchronized (WakeWordGuard.this) {
                     busy = false;
                     mutedByUs = !unmuted;
-                    if (unmuted) host.remember(false);
+                    if (unmuted) remember(false);
                     // A failed unmute is not retried in a loop; the remembered flag brings it back at the next start.
                     if (unmuted) settle();
                 }
             });
         }
+    }
+
+    private synchronized void remember(boolean mutedByUs) {
+        remembered = mutedByUs;
+        host.remember(mutedByUs);
     }
 
     private synchronized void finish(boolean muted) {
