@@ -1,7 +1,7 @@
 name: Release
-# Push a version tag (git tag v1.2.3 && git push origin v1.2.3). This workflow tests and builds the tagged source,
-# then creates the release and attaches the manifest, the ZIP and its checksum, all as github-actions[bot], which is
-# what Kiosk Satellite checks before it installs a release.
+# Push a version tag (git tag v1.2.3 && git push origin v1.2.3), or publish a release with a new v1.2.3 tag on GitHub.
+# This workflow tests and builds the tagged source, then attaches the manifest, the ZIP and its checksum to the
+# release, creating it if needed, all as github-actions[bot], which is what Kiosk Satellite checks before it installs.
 on:
   push:
     tags: ['v*']
@@ -28,6 +28,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          # The tag may come with a release made on GitHub, or alone: make the release only if it is missing.
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi
           gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.zip.sha256 dist/kiosk-satellite-plugin.json --clobber
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --latest
