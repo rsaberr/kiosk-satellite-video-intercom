@@ -21,8 +21,14 @@ import javax.crypto.spec.SecretKeySpec;
  * One call between two kiosks over a single TCP connection: a short handshake that proves both sides hold the same
  * intercom key, then signalling (accept, refuse, bye) and the voice, both ways. Frames are a type byte, a 16-bit
  * length and the payload. The key never crosses the network: each side answers the other's random challenge with an
- * HMAC-SHA256, so a kiosk without the key can neither ring this one nor pose as the kiosk being called. The voice
- * itself is not encrypted; it stays on the local network like Kiosk Satellite's own intercom.
+ * HMAC-SHA256, so a kiosk without the key can neither ring this one nor pose as the kiosk being called.
+ *
+ * The HMAC key is the passphrase stretched with PBKDF2 over the called kiosk's salt (see KeyRing). The called kiosk
+ * opens with a challenge of a random nonce and its salt; the caller derives the key for that salt, or takes the one it
+ * kept from an earlier call, and answers with its own nonce, its proof and its name. The called kiosk checks the proof
+ * with its own key and, when it rings, proves the key back over both nonces. Kiosks still running the first version of
+ * this protocol, which used a plain hash of the passphrase, cannot call or be called. The voice itself is not
+ * encrypted; it stays on the local network like Kiosk Satellite's own intercom.
  */
 final class CallLink {
     interface Listener {
@@ -32,7 +38,7 @@ final class CallLink {
         void onClosed(CallLink link, String reason);
     }
 
-    /** The other kiosk said no: busy, dnd, declined, no answer, or key. */
+    /** The other kiosk said no: busy, dnd, declined, no answer, or key; or it runs an older version. */
     static final class Refused extends IOException {
         final String reason;
 
@@ -45,7 +51,8 @@ final class CallLink {
     static final int CHALLENGE = 1, HELLO = 2, RINGING = 3, REFUSED = 4, ACCEPT = 5, BYE = 6, AUDIO = 7, PING = 8;
     static final int MAX_PAYLOAD = 16 * 1024;
     private static final int NONCE = 16, MAC = 32;
-    private static final int MAX_NAME = 80;
+    static final int MAX_NAME = 80;
+    private static final String LABEL = "ks-video-intercom-2:";
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Socket socket;
@@ -66,22 +73,15 @@ final class CallLink {
         this.peerHost = socket.getInetAddress().getHostAddress();
     }
 
-    /** The key as typed, stretched to HMAC key bytes. */
-    static byte[] keyBytes(String key) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(key.trim().getBytes(StandardCharsets.UTF_8));
-        } catch (GeneralSecurityException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
     /**
      * Calls another kiosk: connects, proves the key and asks to ring. Returns once the other kiosk rings, after it
-     * proved the key too, or throws Refused with its reason.
+     * proved the key too, or throws Refused with its reason. The first call to a kiosk derives the key for its salt,
+     * which takes a moment on a slow tablet; later calls reuse it. Either way this must run on a network thread.
      */
-    static CallLink dial(String host, int port, byte[] key, String myName) throws IOException {
+    static CallLink dial(String host, int port, KeyRing keys, String myName) throws IOException {
         Socket socket = new Socket();
         try {
+            if (keys == null) throw new IOException("no intercom key");
             socket.setTcpNoDelay(true);
             socket.connect(new InetSocketAddress(host, port), 4000);
             socket.setSoTimeout(8000);
@@ -89,8 +89,12 @@ final class CallLink {
             OutputStream out = new BufferedOutputStream(socket.getOutputStream(), 4 * 1024);
             byte[][] frame = new byte[1][];
             int type = readFrame(in, frame);
-            if (type != CHALLENGE || frame[0].length != NONCE) throw new IOException("not a video intercom");
-            byte[] theirs = frame[0];
+            if (type == CHALLENGE && frame[0].length == NONCE) throw new Refused("version");
+            if (type != CHALLENGE || frame[0].length != NONCE + KeyRing.SALT) throw new IOException("not a video intercom");
+            byte[] theirs = new byte[NONCE], salt = new byte[KeyRing.SALT];
+            System.arraycopy(frame[0], 0, theirs, 0, NONCE);
+            System.arraycopy(frame[0], NONCE, salt, 0, KeyRing.SALT);
+            byte[] key = keys.keyFor(salt, false);
             byte[] mine = new byte[NONCE];
             RANDOM.nextBytes(mine);
             byte[] name = name(myName);
@@ -105,7 +109,8 @@ final class CallLink {
             byte[] proof = new byte[MAC];
             System.arraycopy(frame[0], 0, proof, 0, MAC);
             if (!MessageDigest.isEqual(proof, mac(key, "callee", mine, theirs))) throw new IOException("the other kiosk has a different key");
-            String peer = new String(frame[0], MAC, frame[0].length - MAC, StandardCharsets.UTF_8);
+            keys.proved(salt, key);
+            String peer = cleanName(new String(frame[0], MAC, frame[0].length - MAC, StandardCharsets.UTF_8));
             return new CallLink(socket, in, out, peer.isEmpty() ? host : peer);
         } catch (IOException | RuntimeException error) {
             try { socket.close(); } catch (IOException ignored) {}
@@ -115,29 +120,36 @@ final class CallLink {
 
     /**
      * The answering side of dial(): challenges the caller and checks its proof. Returns the link, not yet ringing:
-     * the caller waits for ring() or refuse(). A caller with another key gets "key" and an exception.
+     * the caller waits for ring() or refuse(). A caller with another key gets "key" and an exception. Checking the
+     * proof needs this kiosk's own key, which may still be being derived just after a start; it then waits for it, so
+     * this must run on a network thread.
      */
-    static CallLink answer(Socket socket, byte[] key) throws IOException {
+    static CallLink answer(Socket socket, KeyRing keys) throws IOException {
         try {
+            if (keys == null) throw new IOException("no intercom key");
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(8000);
             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 16 * 1024));
             OutputStream out = new BufferedOutputStream(socket.getOutputStream(), 4 * 1024);
             byte[] mine = new byte[NONCE];
             RANDOM.nextBytes(mine);
-            writeFrame(out, CHALLENGE, mine, NONCE);
+            byte[] challenge = new byte[NONCE + KeyRing.SALT];
+            System.arraycopy(mine, 0, challenge, 0, NONCE);
+            System.arraycopy(keys.salt, 0, challenge, NONCE, KeyRing.SALT);
+            writeFrame(out, CHALLENGE, challenge, challenge.length);
             byte[][] frame = new byte[1][];
             int type = readFrame(in, frame);
             if (type != HELLO || frame[0].length < NONCE + MAC) throw new IOException("not a video intercom call");
             byte[] theirs = new byte[NONCE], proof = new byte[MAC];
             System.arraycopy(frame[0], 0, theirs, 0, NONCE);
             System.arraycopy(frame[0], NONCE, proof, 0, MAC);
+            byte[] key = keys.own();
             if (!MessageDigest.isEqual(proof, mac(key, "caller", mine, theirs))) {
                 byte[] reason = "key".getBytes(StandardCharsets.UTF_8);
                 writeFrame(out, REFUSED, reason, reason.length);
                 throw new IOException("a caller with a different key");
             }
-            String peer = new String(frame[0], NONCE + MAC, frame[0].length - NONCE - MAC, StandardCharsets.UTF_8);
+            String peer = cleanName(new String(frame[0], NONCE + MAC, frame[0].length - NONCE - MAC, StandardCharsets.UTF_8));
             CallLink link = new CallLink(socket, in, out, peer.isEmpty() ? socket.getInetAddress().getHostAddress() : peer);
             link.challenge = mine;
             link.callerNonce = theirs;
@@ -259,7 +271,7 @@ final class CallLink {
         try {
             Mac hmac = Mac.getInstance("HmacSHA256");
             hmac.init(new SecretKeySpec(key, "HmacSHA256"));
-            hmac.update(("ks-video-intercom-1:" + role).getBytes(StandardCharsets.UTF_8));
+            hmac.update((LABEL + role).getBytes(StandardCharsets.UTF_8));
             hmac.update(first);
             hmac.update(second);
             return hmac.doFinal();
@@ -269,8 +281,23 @@ final class CallLink {
     }
 
     private static byte[] name(String name) {
-        String trimmed = name == null ? "" : name.trim();
-        if (trimmed.length() > MAX_NAME) trimmed = trimmed.substring(0, MAX_NAME);
-        return trimmed.getBytes(StandardCharsets.UTF_8);
+        return cleanName(name).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * A kiosk name fit to show: trimmed, control characters and line breaks dropped, and cut to MAX_NAME characters
+     * without splitting a character in two. Used for this kiosk's own name and for every name another kiosk sends.
+     */
+    static String cleanName(String name) {
+        if (name == null) return "";
+        String trimmed = name.trim();
+        StringBuilder clean = new StringBuilder(Math.min(trimmed.length(), MAX_NAME + 1));
+        for (int i = 0; i < trimmed.length() && clean.length() <= MAX_NAME; i++) {
+            char c = trimmed.charAt(i);
+            if (!Character.isISOControl(c) && c != '\u2028' && c != '\u2029') clean.append(c);
+        }
+        int end = clean.length();
+        if (end > MAX_NAME) end = Character.isHighSurrogate(clean.charAt(MAX_NAME - 1)) ? MAX_NAME - 1 : MAX_NAME;
+        return clean.substring(0, end).trim();
     }
 }

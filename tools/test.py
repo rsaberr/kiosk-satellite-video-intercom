@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the plugin's tests without a device: the call protocol over loopback, and the manifest's shape."""
+"""Run the plugin's tests without a device: the call protocol and discovery over loopback, and the manifest's shape."""
 import json
 import os
 from pathlib import Path
@@ -13,8 +13,9 @@ def tool(name):
     return str(Path(java_home) / 'bin' / name) if java_home else name
 
 with tempfile.TemporaryDirectory(prefix='vi-test-') as directory:
-    sources = [root / 'src/videointercom/CallLink.java', *sorted((root / 'tests').rglob('*.java'))]
-    subprocess.run([tool('javac'), '-d', directory, *map(str, sources)], check=True)
+    plain = ['CallLink.java', 'KeyRing.java', 'Discovery.java']  # the classes that must stay free of Android
+    sources = [*(root / 'src/videointercom' / name for name in plain), *sorted((root / 'tests').rglob('*.java'))]
+    subprocess.run([tool('javac'), '-encoding', 'UTF-8', '-d', directory, *map(str, sources)], check=True)
     subprocess.run([tool('java'), '-ea', '-cp', directory, 'videointercom.CallLinkTest'], check=True)
 
 manifest = json.loads((root / 'kiosk-satellite-plugin.json').read_text())

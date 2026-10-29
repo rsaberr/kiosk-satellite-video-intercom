@@ -38,7 +38,7 @@ else:
     platform = max(platforms, key=lambda p: tuple(int(v) for v in p.parent.name[8:].split('.')), default=None)
 if platform is None or not platform.exists():
     raise SystemExit('Set ANDROID_HOME to an Android SDK with a platform installed')
-d8s = sorted((sdk / 'build-tools').glob('*/d8'), key=lambda p: tuple(int(v) for v in p.parent.name.split('.') if v.isdigit()))
+d8s = sorted([*(sdk / 'build-tools').glob('*/d8'), *(sdk / 'build-tools').glob('*/d8.bat')], key=lambda p: tuple(int(v) for v in p.parent.name.split('.') if v.isdigit()))
 if not d8s:
     raise SystemExit('Install Android build-tools for d8')
 java_home = os.environ.get('JAVA_HOME')
@@ -69,11 +69,11 @@ with tempfile.TemporaryDirectory(prefix='vi-build-') as temp:
     sdk_classes, classes, dex = temp / 'sdk', temp / 'classes', temp / 'dex'
     for folder in (sdk_classes, classes, dex):
         folder.mkdir()
-    subprocess.run([tool('javac'), '-nowarn', '--release', '8', '-cp', str(platform), '-d', str(sdk_classes),
+    subprocess.run([tool('javac'), '-nowarn', '-encoding', 'UTF-8', '--release', '8', '-cp', str(platform), '-d', str(sdk_classes),
                     *map(str, sorted((ROOT / 'sdk/src').rglob('*.java')))], check=True)
     sdk_jar = temp / 'sdk.jar'
     subprocess.run([tool('jar'), 'cf', str(sdk_jar), '-C', str(sdk_classes), '.'], check=True)
-    subprocess.run([tool('javac'), '-Xlint:-options', '--release', '8', '-cp', os.pathsep.join([str(sdk_jar), str(platform)]),
+    subprocess.run([tool('javac'), '-Xlint:-options', '-encoding', 'UTF-8', '--release', '8', '-cp', os.pathsep.join([str(sdk_jar), str(platform)]),
                     '-d', str(classes), *map(str, sorted((ROOT / 'src').rglob('*.java')))], check=True)
     subprocess.run([str(d8s[-1]), '--release', '--min-api', str(manifest['minAndroidSdk']), '--lib', str(platform),
                     '--classpath', str(sdk_jar), '--output', str(dex), *map(str, sorted(classes.rglob('*.class')))], check=True)

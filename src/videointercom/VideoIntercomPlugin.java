@@ -9,14 +9,20 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import me.jxl.kiosk.plugins.KioskPlugin;
 import me.jxl.kiosk.plugins.KsTheme;
@@ -61,7 +67,8 @@ public final class VideoIntercomPlugin implements KioskPlugin {
     /** Runs what the screen's buttons ask for: Android forbids network work on its main thread. */
     private ExecutorService work;
 
-    // Finding the other kiosks.
+    // Finding the other kiosks. The key material is replaced, never changed, when the key changes; null without a key.
+    private volatile KeyRing keys;
     private Discovery discovery;
     private String discoveryKey;
     private int discoveryPort;
@@ -70,6 +77,36 @@ public final class VideoIntercomPlugin implements KioskPlugin {
     private ServerSocket server;
     private Thread acceptor;
     private int serverPort;
+    /** Runs the handshakes of incoming connections, a few at a time; replaced with the server. */
+    private ThreadPoolExecutor handshakes;
+    /** The connections whose handshake is still running, with the callId they started under. Guarded by this. */
+    private final Map<Socket, Integer> pending = new HashMap<>();
+    /** Recent failed handshakes per address, so a host guessing the key is held off. Guarded by this. */
+    private final Map<String, Strikes> strikes = new LinkedHashMap<String, Strikes>(16, 0.75f, false) {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, Strikes> eldest) {
+            return size() > MAX_TRACKED_HOSTS;
+        }
+    };
+    /** Connections turned away since the last log line about them, so a flood does not flood the log. Guarded by this. */
+    private int dropped;
+    private long droppedLogged;
+
+    /** How many handshakes run at once, and how many of them may come from one address. */
+    private static final int MAX_HANDSHAKES = 4, MAX_HANDSHAKES_PER_HOST = 2;
+    /** How long a caller has to prove the key and be rung or refused, including a slow key derivation on its side. */
+    private static final long HANDSHAKE_MILLIS = 5000;
+    /** An address that fails this many handshakes within the window is turned away for the rest of the block time. */
+    private static final int MAX_FAILURES = 5;
+    private static final long FAILURE_WINDOW_MILLIS = 60_000, BLOCK_MILLIS = 60_000;
+    private static final int MAX_TRACKED_HOSTS = 64;
+    /** A key shorter than this is refused, because a short key can be guessed. */
+    private static final int MIN_KEY = 16;
+
+    /** Failed handshakes from one address. */
+    private static final class Strikes {
+        long since, blockedUntil;
+        int count;
+    }
 
     // The call. Guarded by this.
     private Mode mode = Mode.IDLE;
@@ -104,6 +141,20 @@ public final class VideoIntercomPlugin implements KioskPlugin {
     private volatile Context context;
     private CallMode callMode;
     private WakeWordGuard wakeWord;
+    /** The hidden setting that remembers that this plugin muted the wake word, until it unmutes it again. */
+    private static final String WAKE_WORD_RESTORE = "wakeWordRestore";
+
+    // Kiosk Satellite's own intercom, which uses the same microphone and speaker. Guarded by this.
+    private String intercomState = "idle";
+    private boolean intercomKnown;  // a read or an event has told intercomState
+    private boolean intercomFollowed;  // the intercom.state event keeps intercomState fresh
+    private int intercomEvents;  // counts events, so an answer to an older read does not overwrite a newer event
+    /** The intercom states with a call or an announcement on, ringing included: this plugin is busy then. */
+    private static final List<String> INTERCOM_BUSY = Arrays.asList("calling", "ringing", "in_call", "broadcasting", "listening");
+    /** The intercom states that use this kiosk's microphone: a call of this plugin ends for them. */
+    private static final List<String> INTERCOM_TAKES_OVER = Arrays.asList("in_call", "broadcasting");
+    /** How long a call waits for the intercom's state when the event cannot be trusted alone. */
+    private static final long INTERCOM_READ_MILLIS = 1000;
 
     @Override public void start(PluginHost host, Map<String, Object> values) {
         this.host = host;
@@ -119,15 +170,26 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         });
         wakeWord = new WakeWordGuard(new WakeWordGuard.Host() {
             @Override public void command(String name, Map<String, Object> arguments, WakeWordGuard.Result result) {
-                host.executeCommand(name, arguments, (ok, data, error) -> result.done(ok, data));
+                try {
+                    host.executeCommand(name, arguments, (ok, data, error) -> result.done(ok, data));
+                } catch (RuntimeException unavailable) {
+                    result.done(false, null);  // an older Kiosk Satellite, or the session ended
+                }
             }
 
             @Override public void remember(boolean mutedByUs) {
-                // Not kept across restarts: a call cut off by a crash can leave the wake word muted until unmuted.
+                try {
+                    host.updateSettings(Collections.<String, Object>singletonMap(WAKE_WORD_RESTORE, mutedByUs));
+                } catch (RuntimeException | LinkageError unavailable) {
+                    trace("cannot remember the wake word mute: " + unavailable);
+                }
             }
         });
+        // A previous session that muted the wake word and was stopped mid-call gets it back now. A call that starts
+        // before the unmute is answered waits for it and then mutes again.
+        wakeWord.restore(Boolean.TRUE.equals(values.get(WAKE_WORD_RESTORE)));
         settings = parse(values);
-        publishState("Idle");
+        publishState(idleState());
         host.executeCommand("getDeviceInfo", Collections.<String, Object>emptyMap(), (ok, data, error) -> {
             if (ok && data instanceof Map) {
                 Object name = ((Map<?, ?>) data).get("name");
@@ -143,6 +205,7 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         } catch (RuntimeException olderHost) {
             // Hanging up with a button needs a newer Kiosk Satellite.
         }
+        followIntercom();
         timers.scheduleAtFixedRate(() -> {
             Discovery d = discovery;
             if (d != null) d.probe();
@@ -151,6 +214,7 @@ public final class VideoIntercomPlugin implements KioskPlugin {
 
     @Override public void configure(Map<String, Object> values) {
         settings = parse(values);
+        wakeWord.saved(Boolean.TRUE.equals(values.get(WAKE_WORD_RESTORE)));
         listen();
         discover();
         PcmPlayer p;
@@ -168,6 +232,10 @@ public final class VideoIntercomPlugin implements KioskPlugin {
     }
 
     @Override public void onEvent(String event, Map<String, Object> payload) {
+        if ("ks.intercom.state".equals(event)) {
+            intercomChanged(payload);
+            return;
+        }
         if (!"ks.device.key".equals(event) || !"down".equals(payload.get("action"))) return;
         Object repeat = payload.get("repeat");
         if (repeat instanceof Number && ((Number) repeat).intValue() > 0) return;
@@ -194,15 +262,29 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         hangup();
     }
 
+    /**
+     * Kiosk Satellite revokes the host before it calls this, so host calls here can fail and each step is released
+     * whether they do or not. The wake word cannot be unmuted any more at this point: the remembered mute brings it
+     * back at the next start.
+     */
     @Override public void stop() {
-        end(null, "stopped", 0);
+        try {
+            end(null, "stopped", 0);
+        } catch (RuntimeException revoked) {
+            // Hiding the call screen failed; everything else of the call is released before that.
+        }
         closeServer();
         synchronized (this) {
             if (discovery != null) discovery.stop();
             discovery = null;
         }
-        closeHome();
-        host.hideOverlay("call");
+        try {
+            closeHome();
+            host.hideOverlay("call");
+        } catch (RuntimeException revoked) {
+            // Kiosk Satellite removes the overlays of a stopped plugin itself.
+        }
+        updateSelfFeed();  // stops the own camera even when closing the preview failed above
         if (timers != null) timers.shutdownNow();
         if (work != null) work.shutdownNow();
     }
@@ -233,17 +315,28 @@ public final class VideoIntercomPlugin implements KioskPlugin {
 
     // ---- Finding kiosks ----
 
-    /** (Re)starts discovery when the key or port changed. */
+    /**
+     * Makes new key material, with a new salt, when the key changed, and (re)starts discovery when the key or port
+     * changed. Deriving this kiosk's own key takes a moment on a slow tablet, so it starts on the work thread instead
+     * of here; a call that arrives before it is done waits for it on its own thread.
+     */
     private synchronized void discover() {
         Settings s = settings;
         String key = s.key.trim();
-        if (discovery != null && key.equals(discoveryKey) && s.port == discoveryPort) return;
+        boolean newKey = !key.equals(discoveryKey);
+        if (newKey) {
+            discoveryKey = key;
+            KeyRing ring = keyProblem(s) != null ? null : new KeyRing(key);
+            keys = ring;
+            if (ring != null) run("deriving the key", ring::own);
+        }
+        if (discovery != null && !newKey && s.port == discoveryPort) return;
         if (discovery != null) discovery.stop();
         discovery = null;
-        discoveryKey = key;
         discoveryPort = s.port;
-        if (key.isEmpty()) return;
-        discovery = new Discovery(s.port, CallLink.keyBytes(key), this::myName);
+        KeyRing ring = keys;
+        if (ring == null) return;
+        discovery = new Discovery(s.port, ring, this::myName);
     }
 
     /** The kiosks to offer: the ones typed under Kiosks first, then the ones found on the network. */
@@ -263,15 +356,22 @@ public final class VideoIntercomPlugin implements KioskPlugin {
 
     // ---- Listening ----
 
+    /**
+     * Listens for calls while the key is usable. Without one, or with a short one, this kiosk takes no calls, makes
+     * none and is not found: the status line and the Video call reading say why.
+     */
     private synchronized void listen() {
         Settings s = settings;
-        if (s.key.trim().isEmpty()) {
+        String problem = keyProblem(s);
+        if (mode == Mode.IDLE) publishState(idleState());
+        if (problem != null) {
             closeServer();
-            host.status("Set an Intercom key, the same on every kiosk", true);
+            host.status(problem, true);
             return;
         }
+        String ready = "Ready on port " + s.port;
         if (server != null && serverPort == s.port) {
-            host.status("Ready on port " + s.port, false);
+            host.status(ready, false);
             return;
         }
         closeServer();
@@ -279,72 +379,237 @@ public final class VideoIntercomPlugin implements KioskPlugin {
             ServerSocket socket = new ServerSocket();
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress(s.port));
+            ThreadPoolExecutor pool = new ThreadPoolExecutor(0, MAX_HANDSHAKES, 30, TimeUnit.SECONDS,
+                    new SynchronousQueue<Runnable>(), r -> {
+                        Thread thread = new Thread(r, "vi-incoming");
+                        thread.setDaemon(true);
+                        return thread;
+                    });
             server = socket;
             serverPort = s.port;
-            Thread thread = new Thread(() -> acceptLoop(socket), "vi-server");
+            handshakes = pool;
+            Thread thread = new Thread(() -> acceptLoop(socket, pool), "vi-server");
             thread.setDaemon(true);
             acceptor = thread;
-            thread.start();
-            host.status("Ready on port " + s.port, false);
+            try {
+                thread.start();
+            } catch (Throwable noThread) {
+                closeServer();
+                host.status("Cannot listen on port " + s.port + ": " + noThread, true);
+                return;
+            }
+            host.status(ready, false);
         } catch (IOException error) {
             host.status("Cannot listen on port " + s.port + ": " + error.getMessage(), true);
         }
     }
 
+    /** Stops listening and drops the handshakes that are still running; calls already rung keep going. */
     private synchronized void closeServer() {
         if (server != null) {
             try { server.close(); } catch (IOException ignored) {}
         }
+        if (handshakes != null) handshakes.shutdownNow();
+        for (Map.Entry<Socket, Integer> entry : pending.entrySet()) {
+            if (entry.getValue() == callId) closeQuietly(entry.getKey());
+        }
         server = null;
         acceptor = null;
         serverPort = 0;
+        handshakes = null;
     }
 
-    private void acceptLoop(ServerSocket socket) {
+    /**
+     * Accepts connections until the server socket is closed, and nothing else ends it: a connection that cannot be
+     * handed to a handshake thread is closed, and a failing accept is retried after a short pause.
+     */
+    private void acceptLoop(ServerSocket socket, ThreadPoolExecutor pool) {
         while (!socket.isClosed()) {
+            Socket client;
             try {
-                Socket client = socket.accept();
-                Thread thread = new Thread(() -> incoming(client), "vi-incoming");
-                thread.setDaemon(true);
-                thread.start();
-            } catch (Throwable closed) {
-                return;
+                client = socket.accept();
+            } catch (Throwable error) {
+                if (socket.isClosed()) return;
+                // Out of file descriptors, say: waiting a little keeps the loop from spinning.
+                dropped("accepting a call failed: " + error);
+                pause(500);
+                continue;
+            }
+            try {
+                dispatch(socket, pool, client);
+            } catch (Throwable error) {
+                // No thread to spare: this caller can try again.
+                synchronized (this) {
+                    pending.remove(client);
+                }
+                closeQuietly(client);
+                dropped("turned away a connection: " + error);
             }
         }
     }
 
-    private void incoming(Socket socket) {
+    /** Hands a new connection to a handshake thread, or closes it when the address is held off or too busy. */
+    private void dispatch(ServerSocket socket, ThreadPoolExecutor pool, Socket client) {
+        String address = client.getInetAddress().getHostAddress();
+        String refused;
+        int startId = 0;
+        synchronized (this) {
+            if (socket != server || pool != handshakes) {
+                closeQuietly(client);
+                return;
+            }
+            refused = admit(address);
+            if (refused == null) {
+                startId = callId;
+                pending.put(client, startId);
+            }
+        }
+        if (refused != null) {
+            closeQuietly(client);
+            dropped("turned away a connection " + refused + " " + address);
+            return;
+        }
+        int id = startId;
+        pool.execute(() -> incoming(client, address, id));
+    }
+
+    /** Why a connection from this address is turned away, or null to take it. Called with the lock held. */
+    private String admit(String address) {
+        Strikes s = strikes.get(address);
+        if (s != null && s.blockedUntil != 0 && s.blockedUntil - now() > 0) return "after repeated failed calls from";
+        if (pending.size() >= MAX_HANDSHAKES) return "while busy with other connections, from";
+        int fromHere = 0;
+        for (Socket other : pending.keySet()) {
+            if (address.equals(other.getInetAddress().getHostAddress())) fromHere++;
+        }
+        return fromHere >= MAX_HANDSHAKES_PER_HOST ? "with too many connections at once from" : null;
+    }
+
+    /** Runs one handshake on a handshake thread, with a deadline for the caller to be rung or refused. */
+    private void incoming(Socket socket, String address, int startId) {
+        ScheduledFuture<?> watchdog;
         try {
-            takeCall(socket);
+            watchdog = timers.schedule(() -> expire(socket), HANDSHAKE_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException stopping) {
+            synchronized (this) {
+                pending.remove(socket);
+            }
+            closeQuietly(socket);
+            return;
+        }
+        boolean proved = false;
+        try {
+            proved = takeCall(socket);
         } catch (Throwable error) {
             trace("incoming call failed: " + error);
+        } finally {
+            watchdog.cancel(false);
+            finished(socket, address, startId, proved);
         }
     }
 
-    private void takeCall(Socket socket) {
+    /**
+     * Closes a connection whose handshake ran past the deadline. Ringing raises callId under the same lock, so a
+     * connection that has become a call is never closed here.
+     */
+    private synchronized void expire(Socket socket) {
+        Integer started = pending.get(socket);
+        if (started != null && started == callId) closeQuietly(socket);
+    }
+
+    /**
+     * Ends the bookkeeping of a handshake. A caller that did not prove the key counts against its address: a wrong
+     * key, garbage, or a caller that ran out of time. A caller turned away as busy or by Do not disturb does not.
+     */
+    private void finished(Socket socket, String address, int startId, boolean proved) {
+        String held = null;
+        synchronized (this) {
+            pending.remove(socket);
+            if (callId != startId) return;
+            closeQuietly(socket);
+            if (proved) return;
+            long now = now();
+            Strikes s = strikes.get(address);
+            if (s == null || now - s.since > FAILURE_WINDOW_MILLIS) {
+                strikes.remove(address);
+                s = new Strikes();
+                s.since = now;
+                strikes.put(address, s);
+            }
+            if (++s.count >= MAX_FAILURES) {
+                s.blockedUntil = now + BLOCK_MILLIS;
+                if (s.blockedUntil == 0) s.blockedUntil = 1;
+                s.count = 0;
+                s.since = now;
+                held = address;
+            }
+        }
+        if (held != null) trace("holding off " + held + " for a minute after " + MAX_FAILURES + " failed calls");
+    }
+
+    /** Logs a turned-away connection, at most once a minute with a count of the others. */
+    private void dropped(String what) {
+        String line = null;
+        synchronized (this) {
+            dropped++;
+            long now = now();
+            if (droppedLogged == 0 || now - droppedLogged >= 60_000) {
+                line = dropped > 1 ? what + " (" + dropped + " turned away since the last note)" : what;
+                dropped = 0;
+                droppedLogged = now == 0 ? 1 : now;
+            }
+        }
+        if (line != null) trace(line);
+    }
+
+    private static long now() {
+        return System.nanoTime() / 1_000_000;
+    }
+
+    private static void pause(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ignored) {
+            // The loop checks the socket again.
+        }
+    }
+
+    private static void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Best effort.
+        }
+    }
+
+    /** Answers a connection: rings, or refuses it. Returns whether the caller proved the key. */
+    private boolean takeCall(Socket socket) {
         CallLink candidate;
         try {
-            candidate = CallLink.answer(socket, CallLink.keyBytes(settings.key));
+            candidate = CallLink.answer(socket, keys);
         } catch (IOException refused) {
             host.log("refused a call: " + refused.getMessage());
-            return;
+            return false;
         }
         Settings s = settings;
+        // A call on Kiosk Satellite's own intercom holds the microphone and the speaker: this kiosk is busy then.
+        boolean intercom = intercomBusy(INTERCOM_READ_MILLIS);
         int id;
         synchronized (this) {
-            if (mode != Mode.IDLE) {
+            if (mode != Mode.IDLE || intercom) {
+                if (intercom) trace("refused a call from " + candidate.peerName + ": the intercom is busy");
                 candidate.refuse("busy");
-                return;
+                return true;
             }
             if ("Do not disturb".equals(s.answerMode)) {
                 candidate.refuse("dnd");
-                return;
+                return true;
             }
             try {
                 candidate.ring(myName());
             } catch (IOException gone) {
                 candidate.close();
-                return;
+                return true;
             }
             id = ++callId;
             mode = Mode.INCOMING;
@@ -375,16 +640,15 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         closeHome();
         updateSelfFeed();
         showCall();
+        return true;
     }
 
     // ---- Placing and taking calls ----
 
     private void call(Peer peer) {
         Settings s = settings;
-        if (s.key.trim().isEmpty()) {
-            host.status("Set an Intercom key, the same on every kiosk", true);
-            return;
-        }
+        String problem = keyProblem(s);
+        boolean intercom = problem == null && intercomBusy(INTERCOM_READ_MILLIS);
         int id;
         synchronized (this) {
             if (mode != Mode.IDLE) return;
@@ -399,6 +663,18 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         publishState("Calling " + peer.name);
         updateSelfFeed();
         showCall();
+        if (problem != null) {
+            // An Extra kiosk can still be listed: the call screen says why it is not called.
+            trace("not calling " + peer.name + ": " + problem);
+            end(id, s.key.trim().isEmpty() ? "Set an Intercom key in the plugin settings" : "Set a longer Intercom key in the plugin settings", 3000);
+            return;
+        }
+        if (intercom) {
+            // The call screen says why for a moment, the same as when the other kiosk is busy.
+            trace("not calling " + peer.name + ": the intercom is busy");
+            end(id, "Busy in an intercom call", 3000);
+            return;
+        }
         Thread thread = new Thread(() -> dial(id, peer), "vi-dial");
         thread.setDaemon(true);
         thread.start();
@@ -417,7 +693,7 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         Settings s = settings;
         CallLink dialled;
         try {
-            dialled = CallLink.dial(peer.host, peer.port, CallLink.keyBytes(s.key), myName());
+            dialled = CallLink.dial(peer.host, peer.port, keys, myName());
         } catch (CallLink.Refused refused) {
             end(id, refusal(refused.reason), 3000);
             return;
@@ -581,9 +857,9 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         if (p != null) p.release();
         if (feed != null) feed.stop();
         updateSelfFeed();
-        if (callMode != null) callMode.leave();
+        leaveCallMode();
         if (inCall) wakeWord.setActive(false);
-        publishState("Idle");
+        publishState(idleState());
         if (lingerMillis > 0) {
             refreshCall();
             timers.schedule(() -> closeAfter(current), lingerMillis, TimeUnit.MILLISECONDS);
@@ -859,7 +1135,157 @@ public final class VideoIntercomPlugin implements KioskPlugin {
     private synchronized void enterCallModeIfNeeded() {
         if (mode != Mode.IN_CALL || context == null) return;
         if (callMode == null) callMode = new CallMode(context);
-        callMode.enter();
+        String route = callMode.enter();
+        if (route != null) trace(route);
+    }
+
+    /**
+     * Leaves call mode at the end of a call. While Kiosk Satellite's own intercom has something on, which started
+     * under this plugin's call mode, the old mode comes back only once the intercom is done (see intercomChanged).
+     */
+    private void leaveCallMode() {
+        CallMode c;
+        synchronized (this) {
+            c = callMode;
+        }
+        if (c == null) return;
+        c.leave(intercomHoldsAudio());
+        // The intercom may have finished between the two reads, before the leave above was waiting for it.
+        if (!intercomHoldsAudio()) c.finishLeave();
+    }
+
+    // ---- Kiosk Satellite's own intercom ----
+
+    /** Starts following Kiosk Satellite's intercom: the event keeps the state fresh, a read gives the first one. */
+    private void followIntercom() {
+        try {
+            host.subscribe("intercom.state");
+            synchronized (this) {
+                intercomFollowed = true;
+            }
+        } catch (RuntimeException olderHost) {
+            // Older Kiosk Satellite versions have no intercom event: each call reads the state instead.
+        }
+        readIntercom(null);
+    }
+
+    /**
+     * Asks Kiosk Satellite for its intercom's state. done, if any, runs once the answer is in, or at once when the
+     * command cannot be sent. An answer is dropped when an event arrived after the question, since the event is newer.
+     */
+    private void readIntercom(Runnable done) {
+        int asked;
+        synchronized (this) {
+            asked = intercomEvents;
+        }
+        try {
+            host.executeCommand("getIntercomState", Collections.<String, Object>emptyMap(), (ok, data, error) -> {
+                try {
+                    if (ok && data instanceof Map) {
+                        Map<?, ?> state = (Map<?, ?>) data;
+                        // While the intercom is off it has no calls, whatever else the answer holds.
+                        String value = Boolean.FALSE.equals(state.get("enabled")) ? "idle" : String.valueOf(state.get("state"));
+                        boolean applied;
+                        synchronized (VideoIntercomPlugin.this) {
+                            applied = intercomEvents == asked;
+                            if (applied) {
+                                intercomState = value;
+                                intercomKnown = true;
+                            }
+                        }
+                        // The intercom being turned off sends no event, so a quiet answer also ends a wait for it.
+                        if (applied && !INTERCOM_BUSY.contains(value)) finishCallModeLater();
+                    }
+                } finally {
+                    if (done != null) done.run();
+                }
+            });
+        } catch (RuntimeException unavailable) {
+            if (done != null) done.run();
+        }
+    }
+
+    /**
+     * Whether Kiosk Satellite's intercom has a call or an announcement on, which makes this plugin busy. A quiet state
+     * that the event keeps fresh is trusted as it is. Otherwise this asks again and waits up to waitMillis for the
+     * answer, since no event says so when the intercom is turned off mid-call. A state that cannot be read counts as
+     * quiet. It can block, so never call it holding the lock or on the host's worker.
+     */
+    private boolean intercomBusy(long waitMillis) {
+        synchronized (this) {
+            if (intercomFollowed && intercomKnown && !INTERCOM_BUSY.contains(intercomState)) return false;
+        }
+        CountDownLatch answered = new CountDownLatch(1);
+        readIntercom(answered::countDown);
+        try {
+            answered.await(waitMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException stopping) {
+            Thread.currentThread().interrupt();
+        }
+        synchronized (this) {
+            return intercomKnown && INTERCOM_BUSY.contains(intercomState);
+        }
+    }
+
+    /** Whether the intercom, as the event last told, has something on that started under this plugin's call mode. */
+    private synchronized boolean intercomHoldsAudio() {
+        return intercomFollowed && intercomKnown && INTERCOM_BUSY.contains(intercomState);
+    }
+
+    /**
+     * The intercom.state event, on the host's worker, so the work goes to the work thread. A call or an announcement
+     * from this kiosk on the intercom ends this plugin's call, so the two do not capture the microphone at once: the
+     * person just chose the intercom, or it answered by itself. A ring on the intercom leaves this call alone until
+     * it is answered. Once the intercom is done, call mode that waited for it is left.
+     */
+    private void intercomChanged(Map<String, Object> payload) {
+        String state = String.valueOf(payload.get("state"));
+        int id;
+        Mode m;
+        synchronized (this) {
+            intercomEvents++;
+            intercomState = state;
+            intercomKnown = true;
+            id = callId;
+            m = mode;
+        }
+        if (INTERCOM_TAKES_OVER.contains(state) && m != Mode.IDLE && m != Mode.ENDING) {
+            run("intercom", () -> yieldToIntercom(id));
+        } else if (!INTERCOM_BUSY.contains(state)) {
+            finishCallModeLater();
+        }
+    }
+
+    /** Leaves call mode, on the work thread, if the end of a call left it waiting for the intercom. */
+    private void finishCallModeLater() {
+        run("call mode", () -> {
+            CallMode c;
+            synchronized (VideoIntercomPlugin.this) {
+                c = callMode;
+            }
+            if (c != null) c.finishLeave();
+        });
+    }
+
+    /** Ends call id because the intercom took the microphone; the other kiosk hears that this one is busy. */
+    private void yieldToIntercom(int id) {
+        CallLink l;
+        Mode m;
+        synchronized (this) {
+            if (callId != id || mode == Mode.IDLE || mode == Mode.ENDING) return;
+            l = link;
+            m = mode;
+        }
+        trace("ending the call: the intercom took over");
+        if (l != null) {
+            if (m == Mode.INCOMING) {
+                l.refuse("busy");
+            } else {
+                l.sendQuietly(CallLink.BYE, new byte[0]);
+                l.close();
+            }
+        }
+        end(id, "Ended for an intercom call", 3000);
     }
 
     private void refreshCall() {
@@ -1021,6 +1447,24 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         return deviceName.isEmpty() ? "Kiosk" : deviceName;
     }
 
+    /** The Video call reading with no call on: Idle, or what the key still needs. */
+    private String idleState() {
+        Settings s = settings;
+        if (keyProblem(s) == null) return "Idle";
+        return s.key.trim().isEmpty() ? "Needs an Intercom key" : "Needs a longer Intercom key";
+    }
+
+    /** Why the Intercom key cannot be used, for the status line, or null when it can. */
+    private static String keyProblem(Settings s) {
+        String key = s.key.trim();
+        if (key.isEmpty()) return "Set an Intercom key, the same on every kiosk.";
+        if (key.length() < MIN_KEY) {
+            return "The Intercom key is too short, so calls are off. Use a long random key of at least " + MIN_KEY
+                    + " characters, the same on every kiosk.";
+        }
+        return null;
+    }
+
     private static String refusal(String reason) {
         switch (reason) {
             case "busy": return "Busy in another call";
@@ -1028,6 +1472,7 @@ public final class VideoIntercomPlugin implements KioskPlugin {
             case "declined": return "Declined";
             case "no answer": return "No answer";
             case "key": return "Different intercom key";
+            case "version": return "Update Video Intercom on both kiosks";
             default: return "Call refused";
         }
     }
@@ -1042,7 +1487,7 @@ public final class VideoIntercomPlugin implements KioskPlugin {
         s.rtspUser = string(values, "rtspUser", "");
         s.rtspPassword = string(values, "rtspPassword", "");
         s.answerMode = string(values, "answerMode", "Ring");
-        s.ringSeconds = Math.max(5, number(values, "ringSeconds", 30));
+        s.ringSeconds = Math.min(120, Math.max(10, number(values, "ringSeconds", 30)));
         s.callVolume = number(values, "callVolume", 80);
         s.ringVolume = number(values, "ringVolume", 70);
         s.microphone = string(values, "microphone", "Automatic");
