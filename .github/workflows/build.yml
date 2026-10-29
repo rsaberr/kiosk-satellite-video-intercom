@@ -4,7 +4,7 @@ name: Release
 # release, creating it if needed, all as github-actions[bot], which is what Kiosk Satellite checks before it installs.
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', 'V*']
 permissions:
   contents: write
 jobs:
@@ -23,7 +23,7 @@ jobs:
       - name: Test
         run: python3 tools/test.py
       - name: Build
-        run: python3 tools/build.py --android-platform 35 --version "${GITHUB_REF_NAME#v}"
+        run: python3 tools/build.py --android-platform 35 --version "${GITHUB_REF_NAME#[vV]}"
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
